@@ -282,8 +282,7 @@ def board_edit(board_id):
 
 @app.route('/board/delete/<int:board_id>')
 def board_delete(board_id):
-    if 'user_id' not in session:
-        return "<script>alert('로그인 후 이용 가능합니다.'); location.href='/login';</script>"
+
     conn = Session.get_connection()
     try:
         with conn.cursor() as cursor:
