@@ -1,15 +1,17 @@
 # pip install flask
 # 파이썬으로 만든 DB연동 콘솔 프로그램을 웹으로 연결하는 프레임 워크
 #  프레임 워크 : 미리 만들어놓은 틀 안에서 작업하는 공간
+import os
 
 #app.py는 플라스크로 서버를 동작하기 위한 파일명 (기본파일)
 
 # static, templates 폴더 필수 (프론트용 파일 모이는 곳)
 #  static : 정적 파일을 모아 놓은( HTML, CSS , JS ....)
 #  templates : 동적 파일을 모아 놓은 ( CRUD화면, 레이아웃, index 등 ...)
-from flask import Flask, render_template, request , redirect, url_for, session
+from flask import Flask, render_template, request, redirect, url_for, session, send_from_directory
 
-from LMS.domain import Board
+from LMS.domain import Board, Score
+from LMS.service import PostService
 #                플라스크,  프론트 연결,     요청,응답,  주소전달 , 주소생성 , 상태저장소
 from common.session import Session
 app = Flask(__name__)
@@ -304,6 +306,302 @@ def board_delete(board_id):
 
 
 ###################################### 게시판 CRUD END ###################################################
+
+######################################### 성적 CRUD ######################################################
+# 주의사항 : role에 admin과 manager만 CUD를 제공한다.
+# 일반 사용자는 role이 user이고 자신의 성적만 볼 수 있다.
+
+@app.route('/score/add') # http://localhost:5000/score/add
+def add_score():
+    if session.get('user_role') not in ('admin', 'manager'):
+        return "<script>alert('권한이 없습니다.'); history.back();</script>"
+
+    # request.args는 URL을 통해서 넘어오는 값 주소 뒤에 ? K = V & K = V ~~~~~~~
+    target_uid = request.args.get('uid')
+    target_name = request.args.get('name')
+
+    conn = Session.get_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 1. 대상 학생의 id 찾기
+            cursor.execute("SELECT id FROM members WHERE uid = %s", (target_uid, ))
+            student = cursor.fetchone()
+
+            # 2. 기존 성적이 있는지 조회
+            existing_score = None
+            if student:
+                cursor.execute("SELECT * FROM scores WHERE member_id = %s", (student['id'],))
+                row = cursor.fetchone()
+                print(row) # 테스트용 코드로 dict 타입으로 콘솔 출력
+                if row :
+                    # 기존에 만든 Score.from_db 활용
+                    existing_score = Score.from_db(row)
+
+                return render_template('score_form.html',
+                                       target_uid=target_uid,
+                                       target_name=target_name,
+                                       score = existing_score)
+    finally:
+        conn.close()
+
+@app.route('/score/save', methods=['POST'])
+def save_score():
+    if session.get('user_role') not in ('admin', 'manager'):
+        return "권한 오류", 403
+        # 웹 페이지에 오류 페이지로 교체
+
+    # 폼 데이터 수집
+    target_uid = request.form.get('target_uid')  # 또는 hidden input
+    kor = int(request.form.get('korean', 0))
+    eng = int(request.form.get('english', 0))
+    math = int(request.form.get('math', 0))
+
+    conn = Session.get_connection()
+
+    try:
+        with conn.cursor() as cursor:
+            # 1. 대상 학생의 id(PK) 가져오기 -> 학생의 번호를 가져옴(ex. 학번)
+            cursor.execute("SELECT id FROM members WHERE uid = %s", (target_uid, ))
+            student = cursor.fetchone()
+            print(student) # 학번 출력
+            if not student:
+                return "<script>alert('존재하지 않는 학생입니다.'); history.back();</script>)"
+
+            # 2. Score 객체 생성(계산 프로퍼티 활용)
+            temp_score = Score(member_id=student.get('id'),kor=kor,eng=eng,math=math)
+            #           __init__를 활용하여 객체 생성
+
+            # 3. 기존 데이터가 있는지 확인
+            cursor.execute("SELECT id FROM scores WHERE member_id = %s", (student['id'],))
+            is_exist = cursor.fetchone() # 성적이 있으면 id가 나오고 없으면 None
+
+            if is_exist:
+                # UPDATA 실행
+                sql = """
+                UPDATE scores SET korean=%s, english=%s, math=%s,
+                                  total=%s, average=%s, grade=%s WHERE member_id = %s
+                """
+                cursor.execute(sql,(temp_score.kor,temp_score.eng,temp_score.math,
+                                    temp_score.total, temp_score.avg, temp_score.grade,
+                                    student['id']))
+            else:
+                # INSETR 실행
+                sql = """
+                    INSERT INTO scores(member_id, korean, english, math, total, average, grade)
+                    VALUES(%s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(sql, (student['id'], temp_score.kor, temp_score.eng, temp_score.math,
+                                     temp_score.total, temp_score.avg, temp_score.grade))
+            conn.commit()
+            return f"<script>alert('{target_uid} 학생 성적 저장 완료!'); location.href='/score/list';</script>"
+    finally:
+        conn.close()
+
+@app.route('/score/list')
+def score_list():
+    # 1. 권한 체크 (관리자나 매니저만 볼 수 있게 설정)
+    if session.get('user_role') not in ('admin', 'manager'):
+        return "<script>alert('권한이 없습니다.'); history.back();</script>"
+
+    conn = Session.get_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 2. JOIN을 사용하여 학생 이름(name)과 성적 데이터를 함께 조회
+            # 성적이 없는 학생은 제외하고, 성적이 있는 학생들만 총점 순으로 정렬
+            sql = """
+                SELECT m.name, m.uid, s.* FROM scores s
+                JOIN members m ON s.member_id = m.id
+                ORDER BY s.total DESC
+            """
+            cursor.execute(sql)
+            datas = cursor.fetchall()
+
+            # 3. DB에서 가져온 딕셔너리 리스트를 Score 객체 리스트로 변환
+            score_objects = []
+            for data in datas:
+                # Score 클래스에 정의하신 from_db 활용
+                s = Score.from_db(data)
+                # 객체에 없는 이름(name) 정보는 수동으로 살짝 넣어주기
+                s.name = data['name']
+                s.uid = data['uid']
+                score_objects.append(s)
+
+            return render_template('score_list.html', scores=score_objects)
+    finally:
+        conn.close()
+
+@app.route('/score/members')
+def score_members():
+    if session.get('user_role') not in ('admin', 'manager'):
+        return "<script>alert('권한이 없습니다.'); history.back();</script>"
+
+    conn = Session.get_connection()
+    try:
+        with conn.cursor() as cursor:
+            # LEFT JOIN을 통해 성적이 있으면 s.id가 숫자로, 없으면 NULL로 나옵니다.
+            sql = """
+                SELECT m.id, m.uid, s.id AS score_id
+                FROM members m
+                LEFT JOIN scores s ON m.id = s.member_id
+                WHERE m.role = 'user'
+                ORDER BY m.name ASC
+            """
+
+            cursor.execute(sql)
+            members = cursor.fetchall()
+            return render_template('score_members_list.html', members=members)
+    finally:
+        conn.close()
+
+@app.route('/score/my')
+def score_my():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
+    conn = Session.get_connection()
+    try:
+        with conn.cursor() as cursor:
+            # 내 id로만 조회
+            sql ="SELECT * FROM scores WHERE member_id = %s"
+            cursor.execute(sql, (session['user_id'],))
+            row = cursor.fetchone()
+            print(row) #dict 타입으로 결과물을 봄
+
+            # Score 객체로 변환 (from_db 활용)
+            score = Score.from_db(row)
+
+            return render_template('score_my.html', score=score)
+
+    finally:
+        conn.close()
+
+####################################### 성적 CRUD END ####################################################
+
+####################################### 파일게시판 CRUD ###################################################
+
+# 파일 처리용 게시판은 특징
+# 1. 파일 업로드 / 다운로드가 가능!!!
+# 2. 단일 파일 / 다중파일 업로드 처리
+# 3. 서비스 패키지를 활용
+## 4. /upload라는 폴더를 사용하겠다. /용량제한 16MB
+# 5. 파일명 중복 방지용코드 활용
+# 6. DB에서 부모객체가 삭제되면 자식 객체도 삭제 되게 cascade 처리한다.
+
+UPLOAD_FOLDER = 'uploads/'
+# 폴더가 없으면 자동 생성
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+    # 폴더 생성용 코드 os.makedirs(이름)
+
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# 최대 업로드 용량 제한( 예: 16MB)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+# bit -> 0, 1
+# 1byte - > 8bit - > 0~255(256개)
+# 1KB -> 1024byte
+# 1MB -> 1024Kbyte
+# 1GB -> 1024Mbyte
+# 1TB -> 1024Gbyte
+# 1PB -> 1024Tbyte
+# 1XB -> 1024Pbyte
+
+@app.route('/filesboard/write', methods=['GET', 'POST'])
+def filesboard_write():
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        title = request.form.get('title')
+        content = request.form.get('content')
+        # 핵심: getlist를 사용해야 리스트 형태로 가져옵니다.
+        files = request.files.getlist('files')
+        # 파일 처리시 html에 필수 코드 : enctype = "multipart/form-data"
+
+        if PostService.save_post(session['user_id'], title, content, files):
+            return "<script>alert('게시글이 등록되었습니다.'); location.href='/filesboard';</script>"
+        else:
+            return "<script>alert('등록 실패'); history.back();</script>"
+    return render_template('filesboard_write.html')
+
+
+# 파일 게시판 목록
+@app.route('/filesboard')
+def filesboard_list():
+    posts = PostService.get_posts()
+    return render_template('filesboard_list.html', posts=posts)
+
+
+# 파일 게시판 상세 보기
+@app.route('/filesboard/view/<int:post_id>')
+def filesboard_view(post_id):
+    post, files = PostService.get_post_detail(post_id)
+    if not post:
+        return "<script>alert('해당 게시글이 없습니다.'); location.href='/filesboard';</script>"
+    return render_template('filesboard_view.html', post=post, files=files)
+
+
+@app.route('/download/<path:filename>')
+def download_file(filename):
+    # 파일이 저장된 폴더(uploads)에서 파일을 찾아 전송합니다.
+    # 프론트 <a href="{{ url_for('download_file', filename=file.save_name) }}" ...> 이부분 처리용
+    # filename은 서버에 저장된 save_name입니다.
+    # 브라우저가 다운로드할 때 보여줄 원본 이름을 쿼리 스트링으로 받거나 DB에서 가져와야 합니다.
+    origin_name = request.args.get('origin_name')
+    return send_from_directory('uploads/', filename, as_attachment=True, download_name=origin_name)
+    # from flask import send_from_directory 필수
+
+    #   return send_from_directory('uploads/', filename)는 브라우져에서 바로 열어버림
+    #   as_attachment=True 로 하면 파일 다운로드 창을 띄움
+    #   저장할 파일명은 download_name=origin_name 로 지정
+
+
+@app.route('/filesboard/delete/<int:post_id>')
+def filesboard_delete(post_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
+    # 삭제 전 작성자 확인을 위해 정보 조회
+    post, _ = PostService.get_post_detail(post_id)
+    # _은 리턴값을 사용하지 않겠다 라는 관례적인 표현 (_) 사용하지 않는 변수
+
+    if not post:
+        return "<script>alert('이미 삭제된 게시글입니다.'); location.href='/filesboard';</script>"
+
+    # 본인 확인 (또는 관리자 권한)
+    if post['member_id'] != session['user_id'] and session.get('user_role') != 'admin':
+        return "<script>alert('삭제 권한이 없습니다.'); history.back();</script>"
+
+    if PostService.delete_post(post_id):
+        return "<script>alert('성공적으로 삭제되었습니다.'); location.href='/filesboard';</script>"
+    else:
+        return "<script>alert('삭제 중 오류가 발생했습니다.'); history.back();</script>"
+
+
+
+
+# 다중파일 수정용
+@app.route('/filesboard/edit/<int:post_id>', methods=['GET', 'POST'])
+def filesboard_edit(post_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
+    if request.method == 'POST':
+        title = request.form.get('title')
+        content = request.form.get('content')
+        files = request.files.getlist('files')  # 다중 파일 가져오기
+
+        if PostService.update_post(post_id, title, content, files):
+            return f"<script>alert('수정되었습니다.'); location.href='/filesboard/view/{post_id}';</script>"
+        return "<script>alert('수정 실패'); history.back();</script>"
+
+    # GET 요청 시 기존 데이터 로드
+    post, files = PostService.get_post_detail(post_id)
+    if post['member_id'] != session['user_id']:
+        return "<script>alert('권한이 없습니다.'); history.back();</script>"
+
+    return render_template('filesboard_edit.html', post=post, files=files)
+
+####################################### 파일게시판 CRUD END ################################################
 
 @app.route('/') # url 생성용 코드 http://localhost:5000/
                 #             or http://192.168.0.0~~~ :5000/
